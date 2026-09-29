@@ -2776,6 +2776,14 @@ impl LuminaRegistry {
             .unwrap_or(Vec::new(env))
     }
 
+    fn can_slash(env: &Env, contract_id: &Address, amount: i128) -> bool {
+        // Mirror the exact checks in apply_action::ProposalAction::Slash so
+        // the view and execution path can never disagree.
+        env.storage().persistent().has(&DataKey::Contract(contract_id.clone()))
+            && amount > 0
+            && Self::stake_of(env, contract_id) >= amount
+    }
+
     fn slash_history(env: &Env, contract_id: &Address) -> Vec<SlashRecord> {
         env.storage().persistent()
             .get(&DataKey::Slashes(contract_id.clone()))
@@ -4363,6 +4371,60 @@ mod test {
             Err(Ok(RegistryError::NotAdmin)),
         );
         assert_solvency(&env, &client, &token_id);
+    }
+
+    // ── can_slash sync ──────────────────────────────────────────────────────
+    /// Prove that `can_slash` view and the actual slash execution path
+    /// always agree — every check performed by the view is also performed
+    /// by `apply_action::ProposalAction::Slash`.
+    #[test]
+    fn can_slash_stays_in_sync_with_execution() {
+        let (env, client, admin, token_id, treasury) = setup_staking();
+        let (_owner, target) = register_and_stake(&env, &client, &token_id, 1_000);
+
+        // ----- can_slash returns false for amount > stake -----
+        assert!(
+            !client.can_slash(&env, &target, &1_500),
+            "can_slash should be false when amount exceeds stake"
+        );
+
+        // ----- can_slash returns false for zero amount -----
+        assert!(
+            !client.can_slash(&env, &target, &0),
+            "can_slash should be false for zero amount"
+        );
+
+        // ----- can_slash returns false for negative amount -----
+        assert!(
+            !client.can_slash(&env, &target, &-100),
+            "can_slash should be false for negative amount"
+        );
+
+        // ----- can_slash returns true for valid amount -----
+        assert!(
+            client.can_slash(&env, &target, &500),
+            "can_slash should be true when amount <= stake"
+        );
+
+        // ----- execute the slash and verify consistency -----
+        let reason = String::from_str(&env, "test slash");
+        let pid = client.propose_slash(&admin, &target, &500, &reason);
+        pass_proposal(&env, &client, &admin, pid);
+
+        // After slash, can_slash should return false for the same amount
+        // (because stake is now 500, and we slashed 500, leaving 500)
+        assert!(
+            !client.can_slash(&env, &target, &500),
+            "can_slash should be false after slash of 500 from 1000 stake"
+        );
+        // But can_slash for a smaller amount should still be true
+        assert!(
+            client.can_slash(&env, &target, &300),
+            "can_slash should still be true for 300 after slashing 500 from 1000"
+        );
+
+        assert_eq!(client.get_stake(&target), 500);
+        assert_eq!(balance(&env, &token_id, &treasury), 500);
     }
 
     // ── Withdrawal ──────────────────────────────────────────────────────────

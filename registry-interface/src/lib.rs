@@ -175,6 +175,11 @@ pub trait RegistryInterface {
     /// after deregistration so penalties stay auditable.
     fn get_slashes(env: Env, contract_id: Address) -> Vec<SlashRecord>;
 
+    /// Whether a slash of `amount` can be applied to `contract_id`.
+    /// Mirrors the exact checks in `apply_action::ProposalAction::Slash` so
+    /// the view and execution path can never disagree.
+    fn can_slash(env: Env, contract_id: Address, amount: i128) -> bool;
+
     /// The full reputation signal for a registration. Returns zeroed values
     /// rather than erroring for an unregistered address, matching
     /// `is_registered`'s tolerance.

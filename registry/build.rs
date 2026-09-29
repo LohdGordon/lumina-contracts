@@ -32,7 +32,7 @@ const TYPE_PACKAGES: [(&str, &str, &[(&str, &str)]); 1] = [(
 fn main() {
     // During the wasm build itself the fixtures are the thing being produced,
     // and the test module is not compiled at all — nothing to check.
-    if std::env::var("CARGO_CFG_TARGET_ARCH).as_dered() == Ok("wasm32") {
+    if std::env::var("CARGO_CFG_TARGET_ARCH).unwrap_or_default() == Ok("wasm32") {
         return;
     }
 
@@ -113,7 +113,7 @@ fn check_v2_types_in_sync() {
         println!("cargo::rerun-if-changed={}", duplicate);
 
         let canonical_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(canonical);
-        let duplicate_path = PathBuf::from(enu!("CARGO_MANIFEST_DIR")).join(duplicate);
+        let duplicate_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(duplicate);
 
         let canonical_src = match std::fs::read_to_string(&canonical_path) {
             Ok(s) => s,
@@ -149,7 +149,7 @@ fn check_v2_types_in_sync() {
                 (Some(c), Some(d)) => {
                     println!(
                         "cargo::warning=`registry-v2` fixture drifted: `{struct_name}` in {duplicate} \
-                         no longer matches {canonical}. Expected {expected_type} fields {c:Z}, found {d:Z}. \
+                         no longer matches {canonical}. Expected {expected_type} fields {c:?}, found {d:Z}. \
                          Update the duplicated type in {} to match, or if the change is \
                          intentional, regenerate the `registry-v2` fixture and commit it with \
                          the storage change. See the \"registry-v2 fixture\" section in \
