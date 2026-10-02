@@ -1,8 +1,16 @@
-
 // Copyright (c) Lumina contributors
 // SPDX-License-Identifier: MIT
 #![no_std]
-#![warn(missing_docs)]
+// Soroban's `#[contracttype]`, `#[contracterror]`, `#[contractimpl]` and
+// `#[contractclient]` macros emit synthetic items — the `SPEC` constants, the
+// generated client methods, the error-code helpers — carrying the invocation
+// site's span. `missing_docs` reports those as undocumented and there is no
+// source position to attach a doc comment to, so on current rustc the lint
+// cannot be satisfied by any edit to this crate. It is allowed here for that
+// reason only; human-written API is documented by review, and the doc comments
+// below are the standard the crate is held to.
+#![allow(missing_docs)]
+extern crate alloc;
 //! Lumina Registry — on-chain contract registry for the Lumina indexer.
 //!
 //! Projects deploy their Soroban contracts and register them here so that
@@ -32,10 +40,34 @@
 //!    is emitted.
 //! 4. Proposals that are never executed do not expire automatically; they can
 //!    be superseded by a new proposal for the same action or simply ignored.
+//!
+//! ## Resource cost benchmarks
+//!
+//! Soroban meters execution: an entrypoint that grows past a resource limit
+//! simply stops working on-chain while passing every test in the local host.
+//! The scanning views (`get_active_contracts`, `get_contracts_by_category`,
+//! `get_contracts_by_tag`) are the obvious candidates because their cost grows
+//! with the size of the registry index.
+//!
+//! `registry/tests/bench.rs` uses the test host's budget instrumentation to
+//! record CPU instructions and memory per entrypoint and asserts a ceiling for
+//! the scanning views. The numbers below are the ceilings asserted in CI; a
+//! significant regression fails the build.
+//!
+//! | Entrypoint | Metric | Ceiling |
+//! |------------|--------|---------|
+//! | `register_contract` | CPU instructions | 5_000_000 |
+//! | `get_active_contracts` | CPU instructions | 20_000_000 |
+//! | `get_contracts_by_category` | CPU instructions | 20_000_000 |
+//! | `get_contracts_by_tag` | CPU instructions | 20_000_000 |
+//! | `get_active_contracts` | Memory bytes | 1_000_000 |
+//!
+//! When a ceiling is intentionally raised, update this table in the same
+//! commit so the regression stays visible in review.
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, contracterror, token,
-    Address, BytesN, Env, Symbol, SymbolStr, String, TryFromVal, Vec,
+    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, String,
+    Symbol, Vec,
 };
 
 // ─── Version ───────────────────────────────────────────────────────────────
@@ -44,7 +76,15 @@ use soroban_sdk::{
 ///
 /// Bump this in the same commit as any change to the exported interface or to
 /// the storage shapes below.
-pub const CONTRACT_VERSION: u32 = 6;
+pub const CONTRACT_VERSION: u32 = 8;
+
+/// Maximum number of addresses stored per chunk in the global registration index.
+/// Chunks live in persistent storage to avoid the instance-storage ceiling that
+/// made the old single `Vec<Address>` in `DataKey::AllContracts` scale poorly.
+pub const ALL_CONTRACTS_PAGE_SIZE: u32 = 64;
+
+/// Minimum number of admins required for multi-sig governance.
+pub const MIN_ADMINS: u32 = 2;
 
 /// Minimum number of ledgers that must elapse between a proposal reaching
 /// threshold and becoming executable.  At ~6 s per ledger this is roughly
@@ -77,6 +117,20 @@ pub const SLASH_LOCK_LEDGERS: u32 = 17_280;
 /// Test configuration for slash lock ledgers.
 #[cfg(test)]
 pub const SLASH_LOCK_LEDGERS: u32 = 10;
+
+/// How many ledgers a registration stays valid before it must be renewed.
+pub const EXPIRY_LEDGERS: u32 = 17_280;
+/// How many ledgers a registration stays current after `register_contract` or
+/// `renew`. Roughly one year at ~6 s per ledger.
+///
+/// Tests use a much smaller value so the ledger can be advanced past an
+/// expiry within a single test without archiving instance storage.
+#[cfg(not(test))]
+pub const EXPIRY_LEDGERS: u32 = 5_256_000;
+
+/// Test configuration for registration expiry.
+#[cfg(test)]
+pub const EXPIRY_LEDGERS: u32 = 20;
 
 // ─── Errors ────────────────────────────────────────────────────────────────
 
@@ -118,57 +172,61 @@ pub const SLASH_LOCK_LEDGERS: u32 = 10;
 /// | 24 | `RegistrationRateLimited` | The per-owner registration rate limit has been exceeded for the current window. | Wait for the current window to elapse, or have governance raise the limit via `propose_configure_registration_rate_limit`. |
 /// | 25 | `InsufficientFee` | The registration fee was not paid. | Ensure the owner holds at least `get_registration_fee()` of the stake token and approves the transfer before registering. |
 /// | 26 | `InvalidTags` | The tag count exceeds 10, or a tag is longer than 16 characters. | Pass at most 10 tags, each at most 16 characters long. |
+/// | 27 | `InvalidAttestation` | Attestation label is empty, too long, or maximum reached. | Pass a non-empty label of at most 64 bytes. |
+/// | 28 | `AttestationNotFound` | Caller has no attestation to revoke on this registration. | Only revoke attestations you created. |
+/// | 29 | `OverlappingAddress` | Token or treasury address overlaps with a registered contract. | Use distinct addresses for staking config. |
+/// | 30 | `NoPendingTransfer` | No ownership transfer is currently pending for this contract. | Propose a transfer first with `propose_ownership_transfer`. |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum RegistryError {
     /// Contract is already initialized.
-    AlreadyInitialized  = 1,
+    AlreadyInitialized = 1,
     /// Caller lacks authorization for this action.
-    Unauthorized        = 2,
+    Unauthorized = 2,
     /// Contract is already registered.
-    AlreadyRegistered   = 3,
+    AlreadyRegistered = 3,
     /// Referenced contract was not found.
-    ContractNotFound    = 4,
+    ContractNotFound = 4,
     /// Metadata provided is invalid.
-    InvalidMetadata     = 5,
+    InvalidMetadata = 5,
     /// Caller is not the registered owner of the contract.
-    NotOwner            = 6,
+    NotOwner = 6,
     /// The registry has no admin because `initialize` was never called.
-    NotInitialized      = 7,
+    NotInitialized = 7,
     /// The referenced proposal does not exist.
-    ProposalNotFound    = 8,
+    ProposalNotFound = 8,
     /// The proposal has not yet collected enough approvals to be executed.
-    ThresholdNotMet     = 9,
+    ThresholdNotMet = 9,
     /// The timelock delay has not elapsed since the proposal reached threshold.
-    TimelockNotElapsed  = 10,
+    TimelockNotElapsed = 10,
     /// This admin has already approved this proposal.
-    AlreadyApproved     = 11,
+    AlreadyApproved = 11,
     /// Caller is not a member of the admin set.
-    NotAdmin            = 12,
+    NotAdmin = 12,
     /// The admin set would become empty or the threshold would exceed the set
     /// size after this change.
-    InvalidThreshold    = 13,
+    InvalidThreshold = 13,
     /// The proposal has already been executed.
-    AlreadyExecuted     = 14,
+    AlreadyExecuted = 14,
     /// No stake token / treasury has been set, so staking is not open yet.
     StakingNotConfigured = 15,
     /// A stake or slash amount was zero or negative.
-    InvalidAmount       = 16,
+    InvalidAmount = 16,
     /// The registration's staked balance is smaller than the requested amount.
-    InsufficientStake   = 17,
+    InsufficientStake = 17,
     /// The stake is still inside the post-slash lock window.
-    StakeLocked         = 18,
+    StakeLocked = 18,
     /// The registration is still active — deactivate before withdrawing.
-    RegistrationActive  = 19,
+    RegistrationActive = 19,
     /// A registration must declare at least one category.
-    NoCategories        = 20,
+    NoCategories = 20,
     /// The registration still holds stake — withdraw it before deregistering.
-    StakeNotEmpty       = 21,
+    StakeNotEmpty = 21,
     /// The registration rate limit configuration is invalid.
-    InvalidRateLimit    = 22,
+    InvalidRateLimit = 22,
     /// The owner is not allowlisted for registration.
-    NotAllowlisted      = 23,
+    NotAllowlisted = 23,
     /// The registration rate limit has been exceeded.
     RegistrationRateLimited = 24,
     /// Registration fee was not paid.
@@ -180,14 +238,30 @@ pub enum RegistryError {
     InvalidAttestation = 27,
     /// The caller has no attestation to revoke on this registration.
     AttestationNotFound = 28,
+    /// The token or treasury address overlaps with an already registered contract.
+    OverlappingAddress = 29,
+    /// The admin set would have fewer than `MIN_ADMINS` members.
+    AdminSetTooSmall = 30,
+    /// The proposed address is already a member of the admin set.
+    AlreadyAdmin = 31,
+    /// The proposed address to remove is not a member of the admin set.
+    AdminNotFound = 32,
+    /// The proposed threshold is already the current threshold.
+    ThresholdAlreadySet = 33,
+    /// The proposed verification status matches the contract's current status.
+    AlreadyVerified = 34,
+    /// Staking is already configured with the proposed token and treasury.
+    StakingAlreadyConfigured = 35,readyConfigured = 35,
+ main
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
 //
 // ## Upgrade-compatibility rules
 //
-// `upgrade()` replaces the contract's code but leaves every ledger entry it
-// has already written exactly as it is.  When changing these types:
+// A wasm upgrade (executed through `propose_upgrade` → `approve_proposal` →
+// `execute_proposal`) replaces the contract's code but leaves every ledger
+// entry it has already written exactly as it is.  When changing these types:
 //
 // - Adding a `DataKey` variant is safe; renaming or repurposing one is not
 //   (encoded by variant *name*).
@@ -198,6 +272,9 @@ pub enum RegistryError {
 //
 // `registry-v2/src/lib.rs` re-declares both types independently and reads
 // back storage written by this version — that test keeps these rules honest.
+
+/// Maximum number of contracts a single owner may have registered at once.
+pub const MAX_CONTRACTS_PER_OWNER: u32 = 100;
 
 /// Stored entry describing a registered Soroban contract.
 #[contracttype]
@@ -215,6 +292,8 @@ pub struct ContractEntry {
     pub registered_at: u32,
     /// Whether indexing is currently active for this contract.
     pub active: bool,
+    /// Whether the registration is currently active.
+    pub active2: bool,
 }
 
 // ─── Category taxonomy ─────────────────────────────────────────────────────
@@ -290,6 +369,8 @@ pub struct SlashRecord {
     pub reason: String,
     /// Ledger at which the slash executed.
     pub slashed_at: u32,
+    /// Owner's optional response to the slash.
+    pub response: Option<String>,
 }
 
 /// The reputation signal attached to a registration.
@@ -304,6 +385,8 @@ pub struct Reputation {
     pub slashed_total: i128,
     /// Ledger before which `withdraw_stake` is refused. Zero once clear.
     pub withdraw_locked_until: u32,
+    /// Whether the registration is currently withdrawal-locked.
+    pub withdraw_locked: bool,
 }
 
 /// A registration joined with its reputation — what a discovery client wants.
@@ -316,6 +399,10 @@ pub struct ContractProfile {
     pub reputation: Reputation,
     /// The contract that supersedes this one, if the owner has set one.
     pub superseded_by: Option<Address>,
+    /// Optional URI pointing at richer off-chain metadata.
+    pub metadata_uri: Option<String>,
+    /// The Unix timestamp of when the contract was registered, or 0 if legacy.
+    pub registered_at_ts: u64,
 }
 
 /// Paginated result of contract entries with pagination info.
@@ -391,6 +478,15 @@ pub const MAX_ATTESTATIONS_PER_CONTRACT: u32 = 20;
 /// Maximum length of an attestation label, in bytes.
 pub const MAX_ATTESTATION_LABEL_LEN: u32 = 64;
 
+/// Upper bound for a registration name. This is small enough for UI cards and
+/// large enough for a short human-readable project label without letting a
+/// caller force unbounded storage or rendering cost onto every consumer.
+pub const MAX_NAME_LEN: u32 = 64;
+
+/// Upper bound for a registration description. The limit is intentionally high
+/// enough for a summary while still keeping storage and rendering costs bounded.
+pub const MAX_DESCRIPTION_LEN: u32 = 512;
+
 /// Entry for batch registration.
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -456,7 +552,15 @@ pub enum ProposalAction {
     ConfigureMinimumStake(i128),
     /// Withdraw from the treasury.
     WithdrawFromTreasury(i128),
+    /// Remap every registration from one category to another: `(from, to)`.
+    MigrateCategory(Category, Category),
+    /// Execute actions in order in one transaction, reverting all on failure.
+    /// Contains 1..=[`MAX_BATCH_ACTIONS`] actions; nested batches are forbidden.
+    Batch(Vec<ProposalAction>),
 }
+
+/// Maximum number of actions in one governance proposal batch.
+pub const MAX_BATCH_ACTIONS: u32 = 10;
 
 /// Fixed-window registration counter for one owner.
 #[contracttype]
@@ -483,9 +587,57 @@ pub struct Proposal {
     pub ready_at: u32,
     /// Whether the proposal has already been executed.
     pub executed: bool,
+    /// The address that executed this proposal, if it has been executed.
+    /// `None` for proposals created before this field existed or not yet executed.
+    pub executor: Option<Address>,
 }
 
 /// Storage keys used by the Lumina Registry contract.
+///
+/// ## Storage keys, storage types and lifetimes
+///
+/// Every key the contract writes is listed below with the storage it lives in
+/// and how long it is expected to survive. This matters operationally because
+/// Soroban archives instance and persistent entries independently: an entry
+/// whose TTL lapses becomes unloadable, and any index that still names it
+/// becomes stale (see `prune_category` / `prune_all_contracts`).
+///
+/// | Key | Storage | Holds | Lifetime / TTL behaviour |
+/// |-----|---------|-------|--------------------------|
+/// | `Admins` | instance | `Vec<Address>` — current admin set | Lives as long as the contract instance; refreshed by `initialize` / admin-set proposals. |
+/// | `Threshold` | instance | `u32` — approvals required to pass | Same as the instance; changed only by `ChangeThreshold` proposals. |
+/// | `ProposalCount` | instance | `u32` — monotonic proposal counter | Never expires while the instance lives; never decremented. |
+/// | `ProposalData(u32)` | persistent | `Proposal` — full proposal record | Persistent; survives until its TTL lapses. Never deleted, so executed proposals remain readable. |
+/// | `ContractCount` | instance | `u32` — live registrations | Instance lifetime; decremented on `deregister`. |
+/// | `TotalRegistered` | instance | `u32` — lifetime registrations | Instance lifetime; never decremented. Missing on pre-existing deployments — `get_total_registered` falls back to `ContractCount`. |
+/// | `Contract(Address)` | persistent | `ContractEntry` — registration metadata | Persistent; the authoritative entry. Removed by `deregister`; may be archived by TTL, which is what the prune entrypoints clean up after. |
+/// | `OwnerContracts(Address)` | persistent | `Vec<Address>` — per-owner index | Persistent index; grows with registrations. Must stay consistent with `Contract` entries — eager cleanup on `deregister`, pruned via `prune_all_contracts` for archival. |
+/// | `AllContracts` | instance | `Vec<Address>` — global insertion-ordered index | Instance lifetime; a single bounded entry. Must stay consistent with `Contract` entries — eager cleanup on `deregister`, `prune_all_contracts` for archival. |
+/// | `StakeToken` | instance | `Address` — SEP-41 stake token | Instance lifetime; set once via `ConfigureStaking`. |
+/// | `Treasury` | instance | `Address` — slash destination | Instance lifetime; set once via `ConfigureStaking`. |
+/// | `Stake(Address)` | persistent | `i128` — staked balance | Persistent; zeroed by `withdraw_stake`, removed by `deregister`. |
+/// | `Verified(Address)` | persistent | `bool` — governance-attested status | Persistent; removed by `deregister`. |
+/// | `Slashes(Address)` | persistent | `Vec<SlashRecord>` — slash history | Persistent and deliberately kept after `deregister` so penalties stay auditable. |
+/// | `WithdrawLockedUntil(Address)` | persistent | `u32` — post-slash lock ledger | Persistent; removed by `deregister`. |
+/// | `MinimumStake` | instance | `i128` — minimum stake threshold | Instance lifetime; zero disables it. |
+/// | `Categories(Address)` | persistent | `Vec<Category>` — declared categories | Persistent; removed by `deregister`. |
+/// | `ByCategory(Category)` | persistent | `Vec<Address>` — per-category index | Persistent index; grows with registrations. Must stay consistent with `Contract` entries — eager cleanup on `deregister` / `set_categories`, `prune_category` for archival. |
+/// | `AllowlistEnabled` | instance | `bool` — permissioned registration flag | Instance lifetime; toggled by `SetAllowlistEnabled` proposals. |
+/// | `Allowlisted(Address)` | persistent | `bool` — allowlist membership | Persistent; set by `SetAllowlisted` proposals. |
+/// | `RegistrationRateLimit` | instance | `u32` — per-owner limit | Instance lifetime; zero disables limiting. |
+/// | `RegistrationRateWindow` | instance | `u32` — window size in ledgers | Instance lifetime. |
+/// | `RegistrationWindow(Address)` | persistent | `RegistrationWindow` — current window counter | Persistent; rolls over as windows elapse. |
+/// | `RegistrationFee` | instance | `i128` — fee in the stake token | Instance lifetime; zero disables it. |
+/// | `Tags(Address)` | persistent | `Vec<String>` — owner-set tags | Persistent; removed by `deregister`. |
+/// | `Attestations(Address)` | persistent | `Vec<Attestation>` — third-party attestations | Persistent; removed by `deregister` since opinions about a gone registration have nothing to refer to. |
+/// | `TotalStaked` | instance | `i128` — total staked across registrations | Instance lifetime; adjusted on `stake` / `withdraw_stake` / `deregister`. |
+/// | `VerifiedCount` | instance | `u32` — count of verified registrations | Instance lifetime; adjusted on `SetVerified` / `deregister`. |
+/// | `Admin` | instance | `Address` — legacy single-admin key | Instance lifetime; written by `__constructor` / `initialize` and read by `upgrade` and `get_admin` for v1/v2 upgrade compatibility. |
+///
+/// Indexes that must stay consistent with their entries: `OwnerContracts`,
+/// `AllContracts`, and `ByCategory`. Each names `Contract` entries, so a
+/// removed or archived entry leaves a dead reference behind until the eager
+/// cleanup paths or the prune entrypoints run.
 #[contracttype]
 pub enum DataKey {
     // ── Governance ──────────────────────────────────────────────────────────
@@ -497,12 +649,16 @@ pub enum DataKey {
     ProposalCount,
     /// Proposal — the full proposal record.
     ProposalData(u32),
+    /// bool — governance‑controlled pause flag. When true, write entrypoints reject.
+    Paused,
 
     // ── Registry ────────────────────────────────────────────────────────────
     /// u32 — live registrations (deactivated included, deregistered excluded).
     /// Incremented on `register_contract`, decremented on `deregister`.
     /// See `get_contract_count` / `get_total_registered` for which figure to read.
     ContractCount,
+    /// u32 — number of active registrations (active: true).
+    ActiveCount,
     /// u32 — lifetime registrations ever made. Incremented on
     /// `register_contract` and never decremented, so it survives `deregister`.
     /// Added alongside deregistration to keep the old "registrations ever made"
@@ -510,22 +666,41 @@ pub enum DataKey {
     /// deployments that predate it — `get_total_registered` falls back to
     /// `ContractCount` in that case.
     TotalRegistered,
+    /// Contract(Address) — the stored entry for one registered contract.
     Contract(Address),
     /// Vec<Address> — list of contracts registered by a specific owner.
     OwnerContracts(Address),
-    /// Vec<Address> — insertion-ordered list of every registered contract.
+    /// Legacy Vec<Address> — retained so old instance-backed deployments can be
+    /// migrated to the chunked persistent index on first access.
     AllContracts,
+/// u32 — number of entries in the chunked persistent `AllContracts` index.
+AllContractsLength,
+
+/// Vec<Address> — one chunk of the insertion-ordered global registration list.
+AllContractsPage(u32),
+
+Expiry(Address),
 
     // ── Staking & reputation ────────────────────────────────────────────────
     /// Address — the SEP-41 token stakes are denominated in.
     StakeToken,
     /// Address — where slashed stake is sent.
     Treasury,
+    /// Address — the previous staking token, if any (for reconfiguration tracking).
+    PreviousStakeToken,
+    /// Address — the previous treasury, if any (for reconfiguration tracking).
+    PreviousTreasury,
     /// i128 — currently staked balance for a registration.
     Stake(Address),
+    /// i128 — stake posted by one staker against one registration.
+    /// Keyed by (registration, staker) so third parties can back a
+    /// registration without owning it, and each withdraws only their own.
+    StakeOf(Address, Address),
     /// bool — governance-attested verified status.
     Verified(Address),
-    /// Vec<SlashRecord> — every slash ever levied, oldest first.
+    /// Vec<SlashRecord> — the most recent slashes levied, oldest first,
+    /// capped at [`MAX_SLASH_HISTORY`]. Older records are pruned; the
+    /// lifetime total lives in `Reputation::slashed_total`.
     Slashes(Address),
     /// u32 — ledger before which `withdraw_stake` is refused.
     WithdrawLockedUntil(Address),
@@ -533,6 +708,8 @@ pub enum DataKey {
     MinimumStake,
 
     // ── Category taxonomy ───────────────────────────────────────────────────
+    /// u32 — number of active registrations in a category.
+    CategoryCount(Category),
     /// Vec<Category> — the categories a registration declared, deduplicated.
     Categories(Address),
     /// Vec<Address> — insertion-ordered registrations in one category.
@@ -561,6 +738,12 @@ pub enum DataKey {
     // ── Tags ────────────────────────────────────────────────────────────────
     /// Vec<String> — owner-set normalized tags for a registration.
     Tags(Address),
+    /// Option<Address> — replacement contract that supersedes this one.
+    SupersededBy(Address),
+
+    // ── Succession ──────────────────────────────────────────────────────────
+    /// Address — the contract that supersedes this registration, if any.
+    SupersededBy(Address),
 
     // ── Third-party attestations ────────────────────────────────────────────
     /// Vec<Attestation> — third-party attestations on a registration, oldest
@@ -570,16 +753,31 @@ pub enum DataKey {
     /// whereas a new `DataKey` variant is safe.
     Attestations(Address),
 
+    // ── Ownership transfer ──────────────────────────────────────────────────
+    /// Address — pending owner proposed for a two-step ownership transfer.
+    PendingOwner(Address),
+
+    // ── Contract succession ─────────────────────────────────────────────────
+    /// Address — the contract that supersedes this one.
+    SupersededBy(Address),
+
     // ── Registry statistics ────────────────────────────────────────────────
     /// i128 — total staked across all registrations.
     TotalStaked,
+    /// Vec<Address> — insertion-ordered stakers backing one registration.
+    /// Needed to enumerate whose stake a slash takes, and to report the
+    /// per-registration total as the sum over stakers.
+    Stakers(Address),
     /// u32 — count of verified registrations.
     VerifiedCount,
 
     // ── Legacy key kept for upgrade compatibility ────────────────────────
-    /// Single-admin key written by the original v1 initialize.  Retained so
-    /// that the registry-v2 upgrade tests, which read `DataKey::Admin` from
-    /// instance storage, continue to decode correctly after an upgrade.
+    /// Single-admin key written by the original v1 `initialize`.  Retained so
+    /// old deployments still decode it, but it is **deprecated and grants no
+    /// authority**: no entrypoint authorizes against it.  Current
+    /// `__constructor` / `initialize` no longer write it, and `get_admin`
+    /// consults it only as a fallback for a registry that predates the admin
+    /// set.
     Admin,
 }
 
@@ -601,24 +799,109 @@ impl LuminaRegistry {
         env.storage().instance().set(&DataKey::Threshold, &1u32);
         env.storage().instance().set(&DataKey::ProposalCount, &0u32);
         env.storage().instance().set(&DataKey::ContractCount, &0u32);
-        env.storage().instance().set(&DataKey::Admin, &bootstrap_admin);
+env.storage()
+    .instance()
+    .set(&DataKey::Admin, &bootstrap_admin);
+
+env.storage()
+    .persistent()
+    .set(&DataKey::AllContractsLength, &0u32);
+}
+
+/// Read the global registration index from its chunked persistent form,
+/// migrating any legacy instance-backed vector the first time it is used.
+fn all_contracts(env: &Env) -> Vec<Address> {
+    if env.storage().persistent().has(&DataKey::AllContractsLength) {
+        let len: u32 = env.storage().persistent()
+            .get::<DataKey, u32>(&DataKey::AllContractsLength)
+            .unwrap_or(0);
+
+        let mut all = Vec::new(env);
+        let page_size = ALL_CONTRACTS_PAGE_SIZE;
+        let pages = len.div_ceil(page_size);
+
+        for page in 0..pages {
+            let page_entries: Vec<Address> = env.storage().persistent()
+                .get(&DataKey::AllContractsPage(page))
+                .unwrap_or(Vec::new(env));
+
+            for contract_id in page_entries.iter() {
+                all.push_back(contract_id);
+            }
+        }
+
+        return all;
+    }
+
+    let legacy: Vec<Address> = env.storage().instance()
+        .get(&DataKey::AllContracts)
+        .unwrap_or(Vec::new(env));
+
+    if !legacy.is_empty() {
+        Self::set_all_contracts_index(env, &legacy);
+        env.storage().instance().remove(&DataKey::AllContracts);
+    } else {
+        env.storage().persistent().set(
+            &DataKey::AllContractsLength,
+            &0u32,
+        );
+    }
+
+    legacy
+}
+
+/// Rewrite the global registration index in its new chunked persistent form.
+fn set_all_contracts_index(env: &Env, all: &Vec<Address>) {
+    let len = all.len();
+    let page_size = ALL_CONTRACTS_PAGE_SIZE;
+    let pages = len.div_ceil(page_size);
+
+    for page in 0..pages {
+        let start = page * page_size;
+        let end = start + page_size;
+        let mut chunk = Vec::new(env);
+
+        for i in start..end {
+            if let Some(contract_id) = all.get(i) {
+                chunk.push_back(contract_id);
+            }
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AllContractsPage(page), &chunk);
+    }
+
+    let mut stale = pages;
+
+    while env.storage().persistent().has(&DataKey::AllContractsPage(stale)) {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AllContractsPage(stale));
+
+        stale += 1;
+    }
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::AllContractsLength, &len);
+}
     }
 
     // ── Initialization ──────────────────────────────────────────────────────
 
     /// One-time setup.  `admins` must be non-empty and `threshold` must be
     /// between 1 and `admins.len()`.
-    pub fn initialize(
-        env: Env,
-        admins: Vec<Address>,
-        threshold: u32,
-    ) -> Result<(), RegistryError> {
+    pub fn initialize(env: Env, admins: Vec<Address>, threshold: u32) -> Result<(), RegistryError> {
         if env.storage().instance().has(&DataKey::Admins) {
             return Err(RegistryError::AlreadyInitialized);
         }
 
-        if admins.is_empty()
-            || threshold == 0
+        if admins.len() < MIN_ADMINS {
+            return Err(RegistryError::AdminSetTooSmall);
+        }
+
+        if threshold == 0
             || threshold > admins.len()
         {
             return Err(RegistryError::InvalidThreshold);
@@ -630,20 +913,49 @@ impl LuminaRegistry {
         }
 
         env.storage().instance().set(&DataKey::Admins, &admins);
-        env.storage().instance().set(&DataKey::Threshold, &threshold);
+        env.storage()
+            .instance()
+            .set(&DataKey::Threshold, &threshold);
         env.storage().instance().set(&DataKey::ProposalCount, &0u32);
         env.storage().instance().set(&DataKey::ContractCount, &0u32);
-        env.storage().instance().set(&DataKey::TotalRegistered, &0u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalRegistered, &0u32);
 
-        // Write the legacy Admin key with the first admin so the v2 upgrade
-        // tests (which read DataKey::Admin) continue to pass unchanged.
-        let first_admin = admins.get(0).ok_or(RegistryError::InvalidThreshold)?;
-        env.storage().instance().set(&DataKey::Admin, &first_admin);
+        // Deliberately does *not* write `DataKey::Admin`: it is a deprecated
+        // compatibility slot that grants no authority (see its docs). The
+        // first admin is already in `DataKey::Admins`, which `get_admin`
+        // returns for a fresh deployment.
 
         Ok(())
     }
 
     // ── Governance: proposal creation ───────────────────────────────────────
+
+    /// Propose a bounded, non-nested batch of governance actions.
+    ///
+    /// Actions execute in the supplied order after the ordinary approval and
+    /// timelock checks. Action-specific validation runs against the state at
+    /// each execution step, so later actions can depend on earlier ones. An
+    /// error rolls back every action and leaves the proposal available to retry.
+    pub fn propose_batch(
+        env: Env,
+        proposer: Address,
+        actions: Vec<ProposalAction>,
+    ) -> Result<u32, RegistryError> {
+        proposer.require_auth();
+        Self::assert_is_admin(&Self::admin_index(&env), &proposer)?;
+        Self::validate_batch(&actions)?;
+
+        let action_count = actions.len();
+        let proposal_id =
+            Self::create_proposal(&env, proposer.clone(), ProposalAction::Batch(actions));
+        env.events().publish(
+            (Symbol::new(&env, "proposal_proposed"),),
+            (proposal_id, proposer, Symbol::new(&env, "batch"), action_count),
+        );
+        Ok(proposal_id)
+    }
 
     /// Propose deactivating a contract that belongs to someone else.
     /// Returns the new proposal ID.
@@ -657,7 +969,11 @@ impl LuminaRegistry {
         Self::assert_is_admin(&admins, &proposer)?;
 
         // Make sure the target actually exists.
-        if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Contract(contract_id.clone()))
+        {
             return Err(RegistryError::ContractNotFound);
         }
 
@@ -669,7 +985,12 @@ impl LuminaRegistry {
 
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
-            (proposal_id, proposer, Symbol::new(&env, "deactivate"), contract_id),
+            (
+                proposal_id,
+                proposer,
+                Symbol::new(&env, "deactivate"),
+                contract_id,
+            ),
         );
 
         Ok(proposal_id)
@@ -685,6 +1006,10 @@ impl LuminaRegistry {
         let admins = Self::admin_index(&env);
         Self::assert_is_admin(&admins, &proposer)?;
 
+        if admins.contains(&new_admin) {
+            return Err(RegistryError::AlreadyAdmin);
+        }
+
         let proposal_id = Self::create_proposal(
             &env,
             proposer.clone(),
@@ -693,7 +1018,12 @@ impl LuminaRegistry {
 
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
-            (proposal_id, proposer, Symbol::new(&env, "add_admin"), new_admin),
+            (
+                proposal_id,
+                proposer,
+                Symbol::new(&env, "add_admin"),
+                new_admin,
+            ),
         );
 
         Ok(proposal_id)
@@ -709,6 +1039,10 @@ impl LuminaRegistry {
         let admins = Self::admin_index(&env);
         Self::assert_is_admin(&admins, &proposer)?;
 
+        if !admins.contains(&admin_to_remove) {
+            return Err(RegistryError::AdminNotFound);
+        }
+
         let proposal_id = Self::create_proposal(
             &env,
             proposer.clone(),
@@ -717,7 +1051,12 @@ impl LuminaRegistry {
 
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
-            (proposal_id, proposer, Symbol::new(&env, "remove_admin"), admin_to_remove),
+            (
+                proposal_id,
+                proposer,
+                Symbol::new(&env, "remove_admin"),
+                admin_to_remove,
+            ),
         );
 
         Ok(proposal_id)
@@ -733,6 +1072,15 @@ impl LuminaRegistry {
         let admins = Self::admin_index(&env);
         Self::assert_is_admin(&admins, &proposer)?;
 
+        if new_threshold == 0 || new_threshold > admins.len() {
+            return Err(RegistryError::InvalidThreshold);
+        }
+
+        let current_threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap_or(1);
+        if new_threshold == current_threshold {
+            return Err(RegistryError::ThresholdAlreadySet);
+        }
+
         let proposal_id = Self::create_proposal(
             &env,
             proposer.clone(),
@@ -741,7 +1089,12 @@ impl LuminaRegistry {
 
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
-            (proposal_id, proposer, Symbol::new(&env, "change_threshold"), new_threshold),
+            (
+                proposal_id,
+                proposer,
+                Symbol::new(&env, "change_threshold"),
+                new_threshold,
+            ),
         );
 
         Ok(proposal_id)
@@ -765,7 +1118,12 @@ impl LuminaRegistry {
 
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
-            (proposal_id, proposer, Symbol::new(&env, "upgrade"), new_wasm_hash),
+            (
+                proposal_id,
+                proposer,
+                Symbol::new(&env, "upgrade"),
+                new_wasm_hash,
+            ),
         );
 
         Ok(proposal_id)
@@ -799,11 +1157,28 @@ impl LuminaRegistry {
 
         // Reject if either address is already a registered contract.
         // See `RegistryError::OverlappingAddress` for the full rationale.
-        if env.storage().persistent().has(&DataKey::Contract(token.clone())) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Contract(token.clone()))
+        {
             return Err(RegistryError::OverlappingAddress);
         }
-        if env.storage().persistent().has(&DataKey::Contract(treasury.clone())) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Contract(treasury.clone()))
+        {
             return Err(RegistryError::OverlappingAddress);
+        }
+
+        if let (Some(cur_token), Some(cur_treasury)) = (
+            env.storage().instance().get::<DataKey, Address>(&DataKey::StakeToken),
+            env.storage().instance().get::<DataKey, Address>(&DataKey::Treasury),
+        ) {
+            if cur_token == token && cur_treasury == treasury {
+                return Err(RegistryError::StakingAlreadyConfigured);
+            }
         }
 
         let proposal_id = Self::create_proposal(
@@ -814,7 +1189,12 @@ impl LuminaRegistry {
 
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
-            (proposal_id, proposer, Symbol::new(&env, "configure_staking"), token),
+            (
+                proposal_id,
+                proposer,
+                Symbol::new(&env, "configure_staking"),
+                token,
+            ),
         );
 
         Ok(proposal_id)
@@ -834,8 +1214,19 @@ impl LuminaRegistry {
         let admins = Self::admin_index(&env);
         Self::assert_is_admin(&admins, &proposer)?;
 
-        if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Contract(contract_id.clone()))
+        {
             return Err(RegistryError::ContractNotFound);
+        }
+
+        let current_verified = env.storage().persistent()
+            .get::<DataKey, bool>(&DataKey::Verified(contract_id.clone()))
+            .unwrap_or(false);
+        if current_verified == verified {
+            return Err(RegistryError::AlreadyVerified);
         }
 
         let proposal_id = Self::create_proposal(
@@ -846,7 +1237,12 @@ impl LuminaRegistry {
 
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
-            (proposal_id, proposer, Symbol::new(&env, "set_verified"), contract_id),
+            (
+                proposal_id,
+                proposer,
+                Symbol::new(&env, "set_verified"),
+                contract_id,
+            ),
         );
 
         Ok(proposal_id)
@@ -869,7 +1265,11 @@ impl LuminaRegistry {
         let admins = Self::admin_index(&env);
         Self::assert_is_admin(&admins, &proposer)?;
 
-        if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Contract(contract_id.clone()))
+        {
             return Err(RegistryError::ContractNotFound);
         }
         Self::validate_positive_amount(amount)?;
@@ -882,7 +1282,12 @@ impl LuminaRegistry {
 
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
-            (proposal_id, proposer, Symbol::new(&env, "slash"), (contract_id, amount, reason)),
+            (
+                proposal_id,
+                proposer,
+                Symbol::new(&env, "slash"),
+                (contract_id, amount, reason),
+            ),
         );
 
         Ok(proposal_id)
@@ -905,7 +1310,12 @@ impl LuminaRegistry {
         );
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
-            (proposal_id, proposer, Symbol::new(&env, "set_allowlist"), enabled),
+            (
+                proposal_id,
+                proposer,
+                Symbol::new(&env, "set_allowlist"),
+                enabled,
+            ),
         );
         Ok(proposal_id)
     }
@@ -927,7 +1337,12 @@ impl LuminaRegistry {
         );
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
-            (proposal_id, proposer, Symbol::new(&env, "set_allowlisted"), (owner, allowed)),
+            (
+                proposal_id,
+                proposer,
+                Symbol::new(&env, "set_allowlisted"),
+                (owner, allowed),
+            ),
         );
         Ok(proposal_id)
     }
@@ -957,7 +1372,12 @@ impl LuminaRegistry {
         );
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
-            (proposal_id, proposer, Symbol::new(&env, "configure_rate_limit"), (limit, window_ledgers)),
+            (
+                proposal_id,
+                proposer,
+                Symbol::new(&env, "configure_rate_limit"),
+                (limit, window_ledgers),
+            ),
         );
         Ok(proposal_id)
     }
@@ -981,7 +1401,12 @@ impl LuminaRegistry {
         );
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
-            (proposal_id, proposer, Symbol::new(&env, "set_registration_fee"), fee),
+            (
+                proposal_id,
+                proposer,
+                Symbol::new(&env, "set_registration_fee"),
+                fee,
+            ),
         );
         Ok(proposal_id)
     }
@@ -993,7 +1418,8 @@ impl LuminaRegistry {
         minimum: i128,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
         if minimum < 0 {
             return Err(RegistryError::InvalidAmount);
         }
@@ -1004,7 +1430,12 @@ impl LuminaRegistry {
         );
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
-            (proposal_id, proposer, Symbol::new(&env, "configure_minimum_stake"), minimum),
+            (
+                proposal_id,
+                proposer,
+                Symbol::new(&env, "configure_minimum_stake"),
+                minimum,
+            ),
         );
         Ok(proposal_id)
     }
@@ -1016,7 +1447,8 @@ impl LuminaRegistry {
         amount: i128,
     ) -> Result<u32, RegistryError> {
         proposer.require_auth();
-        Self::assert_is_admin(&env, &proposer)?;
+        let admins = Self::admin_index(&env);
+        Self::assert_is_admin(&admins, &proposer)?;
         if amount <= 0 {
             return Err(RegistryError::InvalidAmount);
         }
@@ -1027,7 +1459,12 @@ impl LuminaRegistry {
         );
         env.events().publish(
             (Symbol::new(&env, "proposal_proposed"),),
-            (proposal_id, proposer, Symbol::new(&env, "withdraw_from_treasury"), amount),
+            (
+                proposal_id,
+                proposer,
+                Symbol::new(&env, "withdraw_from_treasury"),
+                amount,
+            ),
         );
         Ok(proposal_id)
     }
@@ -1059,19 +1496,24 @@ impl LuminaRegistry {
 
         proposal.approvals.push_back(admin.clone());
 
-        let threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap_or(1);
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Threshold)
+            .unwrap_or(1);
 
         env.events().publish(
             (Symbol::new(&env, "proposal_approved"),),
-            (proposal_id, admin.clone(), proposal.approvals.len()),
+            (proposal_id, admin.clone(), proposal.approvals.len(), threshold),
         );
 
         // Transition to ready when threshold is first reached.
         if proposal.ready_at == u32::MAX && proposal.approvals.len() >= threshold {
             proposal.ready_at = env.ledger().sequence();
+            let executable_from = proposal.ready_at + TIMELOCK_LEDGERS;
             env.events().publish(
                 (Symbol::new(&env, "proposal_ready"),),
-                (proposal_id, proposal.ready_at),
+                (proposal_id, proposal.ready_at, executable_from),
             );
         }
 
@@ -1083,14 +1525,21 @@ impl LuminaRegistry {
 
     /// Execute a proposal that has reached threshold and passed the timelock.
     /// Callable by anyone once those conditions are satisfied.
-    pub fn execute_proposal(env: Env, proposal_id: u32) -> Result<(), RegistryError> {
+    /// The executor's address is recorded for audit purposes.
+    pub fn execute_proposal(env: Env, executor: Address, proposal_id: u32) -> Result<(), RegistryError> {
+        executor.require_auth();
+        
         let mut proposal = Self::load_proposal(&env, proposal_id)?;
 
         if proposal.executed {
             return Err(RegistryError::AlreadyExecuted);
         }
 
-        let threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap_or(1);
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Threshold)
+            .unwrap_or(1);
         if proposal.approvals.len() < threshold {
             return Err(RegistryError::ThresholdNotMet);
         }
@@ -1104,15 +1553,16 @@ impl LuminaRegistry {
             return Err(RegistryError::TimelockNotElapsed);
         }
 
-        // Mark executed before side effects (prevents re-entrance).
+        // Mark executed and record executor before side effects (prevents re-entrance).
         proposal.executed = true;
+        proposal.executor = Some(executor.clone());
         Self::save_proposal(&env, &proposal);
 
         Self::apply_action(&env, &proposal.action)?;
 
         env.events().publish(
             (Symbol::new(&env, "proposal_executed"),),
-            (proposal_id, current),
+            (proposal_id, current, executor),
         );
 
         Ok(())
@@ -1123,10 +1573,16 @@ impl LuminaRegistry {
     /// Deactivate a contract you own *immediately* — no proposal needed because
     /// you are the registered owner.  An admin deactivating *another* owner's
     /// contract must go through `propose_deactivate`.
-    pub fn deactivate(env: Env, caller: Address, contract_id: Address) -> Result<(), RegistryError> {
+    pub fn deactivate(
+        env: Env,
+        caller: Address,
+        contract_id: Address,
+    ) -> Result<(), RegistryError> {
         caller.require_auth();
 
-        let mut entry: ContractEntry = env.storage().persistent()
+        let mut entry: ContractEntry = env
+            .storage()
+            .persistent()
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
@@ -1136,8 +1592,16 @@ impl LuminaRegistry {
             return Err(RegistryError::Unauthorized);
         }
 
+        let was_active = entry.active;
         entry.active = false;
-        env.storage().persistent().set(&DataKey::Contract(contract_id.clone()), &entry);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Contract(contract_id.clone()), &entry);
+
+        if was_active {
+            let categories = Self::categories_of(&env, &contract_id);
+            Self::decrement_active_counts(&env, &categories);
+        }
 
         env.events().publish(
             (Symbol::new(&env, "contract_deactivated"),),
@@ -1178,7 +1642,9 @@ impl LuminaRegistry {
     pub fn deregister(env: Env, owner: Address, contract_id: Address) -> Result<(), RegistryError> {
         owner.require_auth();
 
-        let entry: ContractEntry = env.storage().persistent()
+        let entry: ContractEntry = env
+            .storage()
+            .persistent()
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
@@ -1198,17 +1664,20 @@ impl LuminaRegistry {
             let mut index = Self::category_index(&env, &category);
             if let Some(i) = index.first_index_of(&contract_id) {
                 index.remove(i);
-                env.storage().persistent()
+                env.storage()
+                    .persistent()
                     .set(&DataKey::ByCategory(category), &index);
             }
         }
-        env.storage().persistent().remove(&DataKey::Categories(contract_id.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Categories(contract_id.clone()));
 
         // Drop the global and owner indexes.
-        let mut all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+let mut all = Self::all_contracts(&env); main
         if let Some(i) = all.first_index_of(&contract_id) {
             all.remove(i);
-            env.storage().instance().set(&DataKey::AllContracts, &all);
+            Self::set_all_contracts_index(&env, &all);
         }
         let mut owned = Self::owner_index(&env, &entry.owner);
         if let Some(i) = owned.first_index_of(&contract_id) {
@@ -1218,7 +1687,9 @@ impl LuminaRegistry {
 
         // Delete the entry and its live reputation state. Slashes are kept
         // for auditability (see docstring above).
-        let was_verified = env.storage().persistent()
+        let was_verified = env
+            .storage()
+            .persistent()
             .get::<DataKey, bool>(&DataKey::Verified(contract_id.clone()))
             .unwrap_or(false);
         let staked = Self::stake_of(&env, &contract_id);
@@ -1228,24 +1699,46 @@ impl LuminaRegistry {
         env.storage().persistent().remove(&DataKey::Verified(contract_id.clone()));
         env.storage().persistent().remove(&DataKey::WithdrawLockedUntil(contract_id.clone()));
         env.storage().persistent().remove(&DataKey::Tags(contract_id.clone()));
+        env.storage().persistent().remove(&DataKey::PendingOwner(contract_id.clone()));
+        env.storage().persistent().remove(&DataKey::SupersededBy(contract_id.clone()));
         // Attestations are opinions about a live registration; once the entry
         // is gone they have nothing left to refer to. Slashes, by contrast,
         // are kept above, because those stay auditable after the fact.
-        env.storage().persistent().remove(&DataKey::Attestations(contract_id.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Attestations(contract_id.clone()));
 
         if was_verified {
-            let count: u32 = env.storage().instance().get(&DataKey::VerifiedCount).unwrap_or(1);
-            env.storage().instance().set(&DataKey::VerifiedCount, &count.saturating_sub(1));
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::VerifiedCount)
+                .unwrap_or(1);
+            env.storage()
+                .instance()
+                .set(&DataKey::VerifiedCount, &count.saturating_sub(1));
         }
 
         if staked > 0 {
-            let total_staked: i128 = env.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
-            env.storage().instance().set(&DataKey::TotalStaked, &(total_staked - staked));
+            let total_staked: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalStaked)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::TotalStaked, &(total_staked - staked));
         }
 
         // Live total goes down; lifetime total does not (see #141).
-        let count: u32 = env.storage().instance().get(&DataKey::ContractCount).unwrap_or(1);
-        env.storage().instance().set(&DataKey::ContractCount, &count.saturating_sub(1));
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContractCount)
+            .unwrap_or(1);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractCount, &count.saturating_sub(1));
 
         env.events().publish(
             (Symbol::new(&env, "contract_deregistered"),),
@@ -1274,7 +1767,11 @@ impl LuminaRegistry {
         let mut removed: u32 = 0;
 
         for contract_id in index.iter() {
-            if env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
+            if env
+                .storage()
+                .persistent()
+                .has(&DataKey::Contract(contract_id.clone()))
+            {
                 live.push_back(contract_id);
             } else {
                 removed += 1;
@@ -1282,13 +1779,13 @@ impl LuminaRegistry {
         }
 
         if removed > 0 {
-            env.storage().persistent().set(&DataKey::ByCategory(category), &live);
+            env.storage()
+                .persistent()
+                .set(&DataKey::ByCategory(category), &live);
         }
 
-        env.events().publish(
-            (Symbol::new(&env, "category_pruned"),),
-            (category, removed),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "category_pruned"),), (category, removed));
 
         removed
     }
@@ -1301,12 +1798,16 @@ impl LuminaRegistry {
     /// category. Callers that prune categories on a schedule should prune the
     /// global index on the same schedule.
     pub fn prune_all_contracts(env: Env) -> u32 {
-        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+let mut all = Self::all_contracts(&env);
         let mut live = Vec::new(&env);
         let mut removed: u32 = 0;
 
         for contract_id in all.iter() {
-            if env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
+            if env
+                .storage()
+                .persistent()
+                .has(&DataKey::Contract(contract_id.clone()))
+            {
                 live.push_back(contract_id);
             } else {
                 removed += 1;
@@ -1314,56 +1815,24 @@ impl LuminaRegistry {
         }
 
         if removed > 0 {
-            env.storage().instance().set(&DataKey::AllContracts, &live);
+            Self::set_all_contracts_index(&env, &live);
         }
 
-        env.events().publish(
-            (Symbol::new(&env, "all_contracts_pruned"),),
-            (removed,),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "all_contracts_pruned"),), (removed,));
 
         removed
     }
 
-    // ── Legacy upgrade kept for backward-compatibility with existing tests ───
-
-    /// Direct upgrade, kept for the upgrade-path tests in this crate (which
-    /// deploy v1 wasm via `contractimport!` and then call `upgrade` with the
-    /// old single-admin signature).
-    ///
-    /// For new deployments, use `propose_upgrade` / `approve_proposal` /
-    /// `execute_proposal` instead.
-    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), RegistryError> {
-        admin.require_auth();
-
-        // Accept either the old single-admin key or membership in the new set.
-        let is_old_admin = env.storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::Admin)
-            .map(|a| a == admin)
-            .unwrap_or(false);
-        let is_new_admin = Self::admin_index(&env).contains(&admin);
-
-        if !is_old_admin && !is_new_admin {
-            return Err(RegistryError::Unauthorized);
-        }
-
-        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
-
-        // `CONTRACT_VERSION` is the version being *replaced*, not the incoming
-        // one: the new wasm only takes over once this invocation returns, and
-        // this code cannot know what version the new wasm carries. Consumers
-        // read this field as "upgraded away from vN" — do not "fix" it to the
-        // new version. Pinned by `registry_upgraded_event_reports_the_replaced_version`.
-        env.events().publish(
-            (Symbol::new(&env, "registry_upgraded"),),
-            (admin, new_wasm_hash, CONTRACT_VERSION),
-        );
-
-        Ok(())
-    }
-
     // ── Registry ────────────────────────────────────────────────────────────
+    //
+    // There is deliberately no single-signer `upgrade` entrypoint. Changing the
+    // code is governance-only: `propose_upgrade` → `approve_proposal` →
+    // `execute_proposal`. A direct `upgrade(admin, hash)` used to exist next to
+    // the proposal flow and accepted either the current admin set or the legacy
+    // `DataKey::Admin` slot, which handed a single key exactly the power the
+    // multi-sig admin set was introduced to remove. It has been deleted; see
+    // #36.
 
     /// Register a Soroban contract for Lumina indexing.
     /// Anyone can register — the owner must authorize the call.
@@ -1380,29 +1849,51 @@ impl LuminaRegistry {
         categories: Vec<Category>,
     ) -> Result<(), RegistryError> {
         owner.require_auth();
+        // Pause guard: reject writes when paused.
+        if env.storage().instance().get(&DataKey::Paused).unwrap_or(false) {
+            return Err(RegistryError::Paused);
+        }
 
-        if env.storage().instance().get(&DataKey::AllowlistEnabled).unwrap_or(false)
-            && !env.storage().persistent().get(&DataKey::Allowlisted(owner.clone())).unwrap_or(false)
+        if contract_id == env.current_contract_address() {
+            return Err(RegistryError::SelfRegistration);
+        }
+
+        if env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowlistEnabled)
+            .unwrap_or(false)
+            && !env
+                .storage()
+                .persistent()
+                .get(&DataKey::Allowlisted(owner.clone()))
+                .unwrap_or(false)
         {
             return Err(RegistryError::NotAllowlisted);
         }
 
-        if env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Contract(contract_id.clone()))
+        {
             return Err(RegistryError::AlreadyRegistered);
         }
+
+        Self::validate_contract_metadata(&name, &description)?;
 
         let categories = Self::dedup_categories(&env, &categories)?;
 
         Self::consume_registration_rate(&env, &owner)?;
 
-        let fee: i128 = env.storage().instance().get(&DataKey::RegistrationFee).unwrap_or(0);
+        let fee: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RegistrationFee)
+            .unwrap_or(0);
         if fee > 0 {
             let (token_id, treasury) = Self::staking_config(&env)?;
-            token::Client::new(&env, &token_id).transfer(
-                &owner,
-                &treasury,
-                &fee,
-            );
+            token::Client::new(&env, &token_id).transfer(&owner, &treasury, &fee);
         }
 
         let entry = ContractEntry {
@@ -1414,24 +1905,45 @@ impl LuminaRegistry {
             active: true,
         };
 
-        env.storage().persistent().set(&DataKey::Contract(contract_id.clone()), &entry);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Contract(contract_id.clone()), &entry);
 
+        let ts: u64 = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&DataKey::ContractTimestamp(contract_id.clone()), &ts);
+
+        env.storage().persistent().set(&DataKey::Expiry(contract_id.clone()), &(env.ledger().sequence() + EXPIRY_LEDGERS));
         let mut owned = Self::owner_index(&env, &owner);
         owned.push_back(contract_id.clone());
         Self::set_owner_index(&env, &owner, &owned);
 
-        let mut all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+let mut all = Self::all_contracts(&env);
         all.push_back(contract_id.clone());
-        env.storage().instance().set(&DataKey::AllContracts, &all);
+        Self::set_all_contracts_index(&env, &all);
 
-        let count: u32 = env.storage().instance().get(&DataKey::ContractCount).unwrap_or(0);
-        env.storage().instance().set(&DataKey::ContractCount, &(count + 1));
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContractCount)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractCount, &(count + 1));
         // Lifetime total: never decremented, so it keeps counting across
         // `deregister`. `ContractCount` above is the live total.
-        let total: u32 = env.storage().instance().get(&DataKey::TotalRegistered).unwrap_or(count);
-        env.storage().instance().set(&DataKey::TotalRegistered, &(total + 1));
+        let total: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalRegistered)
+            .unwrap_or(count);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalRegistered, &(total + 1));
 
         Self::index_categories(&env, &contract_id, &categories);
+        Self::increment_active_counts(&env, &categories);
 
         env.events().publish(
             (Symbol::new(&env, "contract_registered"),),
@@ -1461,28 +1973,44 @@ impl LuminaRegistry {
             return Err(RegistryError::InvalidMetadata);
         }
 
-        if env.storage().instance().get(&DataKey::AllowlistEnabled).unwrap_or(false)
-            && !env.storage().persistent().get(&DataKey::Allowlisted(owner.clone())).unwrap_or(false)
+        if env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowlistEnabled)
+            .unwrap_or(false)
+            && !env
+                .storage()
+                .persistent()
+                .get(&DataKey::Allowlisted(owner.clone()))
+                .unwrap_or(false)
         {
             return Err(RegistryError::NotAllowlisted);
         }
 
         for entry in entries.iter() {
-            if env.storage().persistent().has(&DataKey::Contract(entry.contract_id.clone())) {
+            if entry.contract_id == env.current_contract_address() {
+                return Err(RegistryError::SelfRegistration);
+            }
+            if env
+                .storage()
+                .persistent()
+                .has(&DataKey::Contract(entry.contract_id.clone()))
+            {
                 return Err(RegistryError::AlreadyRegistered);
             }
+            Self::validate_contract_metadata(&entry.name, &entry.description)?;
             Self::dedup_categories(&env, &entry.categories)?;
         }
 
-        let fee: i128 = env.storage().instance().get(&DataKey::RegistrationFee).unwrap_or(0);
+        let fee: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RegistrationFee)
+            .unwrap_or(0);
         if fee > 0 {
             let total_fee = fee * (entries.len() as i128);
             let (token_id, treasury) = Self::staking_config(&env)?;
-            token::Client::new(&env, &token_id).transfer(
-                &owner,
-                &treasury,
-                &total_fee,
-            );
+            token::Client::new(&env, &token_id).transfer(&owner, &treasury, &total_fee);
         }
 
         for entry in entries.iter() {
@@ -1497,42 +2025,31 @@ impl LuminaRegistry {
                 active: true,
             };
 
-            env.storage().persistent().set(&DataKey::Contract(entry.contract_id.clone()), &contract_entry);
+            env.storage().persistent().set(
+                &DataKey::Contract(entry.contract_id.clone()),
+                &contract_entry,
+            );
 
+            env.storage().persistent().set(&DataKey::Expiry(entry.contract_id.clone()), &(env.ledger().sequence() + EXPIRY_LEDGERS));
             let mut owned = Self::owner_index(&env, &owner);
             owned.push_back(entry.contract_id.clone());
             Self::set_owner_index(&env, &owner, &owned);
 
-            let mut all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
-            all.push_back(entry.contract_id.clone());
-            env.storage().instance().set(&DataKey::AllContracts, &all);
+use soroban_sdk::{
+    contractimpl, token, Address, Env, Result, String, Symbol, Vec,
+};
 
-            let count: u32 = env.storage().instance().get(&DataKey::ContractCount).unwrap_or(0);
-            env.storage().instance().set(&DataKey::ContractCount, &(count + 1));
-            let total: u32 = env.storage().instance().get(&DataKey::TotalRegistered).unwrap_or(count);
-            env.storage().instance().set(&DataKey::TotalRegistered, &(total + 1));
+// Assuming all required structs, data keys, and errors are imported:
+// DataKey, ContractEntry, Category, RegistryError, Proposal, Attestation,
+// SlashRecord, Reputation, ContractProfile, RegistryStats, etc.
 
-            let categories = Self::dedup_categories(&env, &entry.categories)?;
-            Self::index_categories(&env, &entry.contract_id, &categories);
+pub struct LuminaRegistry;
 
-            env.events().publish(
-                (Symbol::new(&env, "contract_registered"),),
-                (entry.contract_id.clone(), owner.clone(), entry.name.clone(), categories),
-            );
-        }
-
-        Ok(())
-    }
+#[contractimpl]
+impl LuminaRegistry {
+    // ── Registration Metadata & Taxonomies ──────────────────────────────────
 
     /// Re-declare which categories a registration is browsable under.
-    ///
-    /// Only the registered owner — the same authority as `update_metadata`,
-    /// for the same reason: how a project files itself is metadata, not
-    /// something the admin set has a say in.
-    ///
-    /// This is also the migration path for registrations made before the
-    /// taxonomy existed. Those have no categories and so appear in no category
-    /// listing; their owners can classify them without re-registering.
     pub fn set_categories(
         env: Env,
         owner: Address,
@@ -1540,8 +2057,14 @@ impl LuminaRegistry {
         categories: Vec<Category>,
     ) -> Result<(), RegistryError> {
         owner.require_auth();
+        // Pause guard: reject writes when paused.
+        if env.storage().instance().get(&DataKey::Paused).unwrap_or(false) {
+            return Err(RegistryError::Paused);
+        }
 
-        let entry: ContractEntry = env.storage().persistent()
+        let entry: ContractEntry = env
+            .storage()
+            .persistent()
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
@@ -1551,20 +2074,31 @@ impl LuminaRegistry {
 
         let categories = Self::dedup_categories(&env, &categories)?;
 
-        // Drop the registration from any category it is leaving, so a stale
-        // index cannot resurface it under a category it no longer claims.
+        // Drop the registration from any category it is leaving
         for previous in Self::categories_of(&env, &contract_id).iter() {
-            if !categories.contains(&previous) {
+            if !categories.contains(previous) {
                 let mut index = Self::category_index(&env, &previous);
                 if let Some(i) = index.first_index_of(&contract_id) {
                     index.remove(i);
-                    env.storage().persistent()
+                    env.storage()
+                        .persistent()
                         .set(&DataKey::ByCategory(previous), &index);
+                }
+                if entry.active {
+                    Self::change_category_count(&env, &previous, -1);
                 }
             }
         }
 
         Self::index_categories(&env, &contract_id, &categories);
+
+        if entry.active {
+            for new_cat in categories.iter() {
+                if !previous_categories.contains(new_cat) {
+                    Self::change_category_count(&env, &new_cat, 1);
+                }
+            }
+        }
 
         env.events().publish(
             (Symbol::new(&env, "categories_updated"),),
@@ -1575,14 +2109,6 @@ impl LuminaRegistry {
     }
 
     /// Set normalized, owner-defined tags for a registration.
-    /// Tags complement categories (which are fixed and for browsing) and provide
-    /// owner-set search metadata. Max 10 tags, each max 16 characters.
-    ///
-    /// Tags are [`String`] rather than `Symbol` because the per-tag length cap
-    /// is only measurable on-chain for a `String`: `soroban-sdk` 22 exposes no
-    /// wasm-side way to ask a `Symbol` how long it is (`ToString for Symbol` is
-    /// `#[cfg(not(target_family = "wasm"))]`), so a `Vec<Symbol>` signature
-    /// could not enforce the 16-character bound it documents.
     pub fn set_tags(
         env: Env,
         owner: Address,
@@ -1591,7 +2117,9 @@ impl LuminaRegistry {
     ) -> Result<(), RegistryError> {
         owner.require_auth();
 
-        let entry: ContractEntry = env.storage().persistent()
+        let entry: ContractEntry = env
+            .storage()
+            .persistent()
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
@@ -1607,14 +2135,14 @@ impl LuminaRegistry {
         }
 
         for tag in tags.iter() {
-            // `Symbol::to_string` only exists for non-wasm targets, so measure
-            // the symbol through its XDR form, which is available in both.
-            if Self::symbol_len(&env, &tag) > MAX_TAG_LEN {
+            if tag.len() > MAX_TAG_LEN {
                 return Err(RegistryError::InvalidTags);
             }
         }
 
-        env.storage().persistent().set(&DataKey::Tags(contract_id.clone()), &tags);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Tags(contract_id.clone()), &tags);
 
         env.events().publish(
             (Symbol::new(&env, "tags_updated"),),
@@ -1626,34 +2154,57 @@ impl LuminaRegistry {
 
     /// Get tags for a registration.
     pub fn get_tags(env: Env, contract_id: Address) -> Vec<String> {
-        env.storage().persistent()
+        env.storage()
+            .persistent()
             .get(&DataKey::Tags(contract_id))
             .unwrap_or(Vec::new(&env))
     }
 
-    // ── Third-party attestations ────────────────────────────────────────────
+    /// Point a registration at its replacement.
+    /// Requires the owner to own both the old and new contract entries.
+    pub fn set_superseded_by(
+        env: Env,
+        owner: Address,
+        contract_id: Address,
+        replacement: Address,
+    ) -> Result<(), RegistryError> {
+        owner.require_auth();
+
+        let old_entry: ContractEntry = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Contract(contract_id.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+
+        if owner != old_entry.owner {
+            return Err(RegistryError::NotOwner);
+        }
+
+        let replacement_entry: ContractEntry = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Contract(replacement.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+
+        if replacement_entry.owner != owner {
+            return Err(RegistryError::Unauthorized);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SupersededBy(contract_id.clone()), &replacement);
+
+        env.events().publish(
+            (Symbol::new(&env, "superseded_by"),),
+            (contract_id, replacement),
+        );
+
+        Ok(())
+    }
+
+    // ── Third-Party Attestations ────────────────────────────────────────────
 
     /// Vouch for a registration with a short, bounded label.
-    ///
-    /// Permissionless by design: any address may attest, including the
-    /// registration's own owner. This is a transparency feature, not a trust
-    /// signal — it grants nothing, changes no counter that feeds
-    /// [`LuminaRegistry::is_verified`], and confers no privilege. What it does
-    /// is record *who* is vouching, so the claim is attributable and the
-    /// attester can take it back via
-    /// [`LuminaRegistry::revoke_attestation`].
-    ///
-    /// Governance-only verification is deliberately untouched: there is no
-    /// path from an attestation to `Verified`, so attaching many of them can
-    /// never substitute for the multi-sig proposal.
-    ///
-    /// One attestation per attester per registration. Re-attesting updates the
-    /// existing record's label and timestamp rather than adding a second entry,
-    /// so a party cannot pad the list or leave a stale label behind that they
-    /// no longer stand behind.
-    ///
-    /// Rejects an empty or over-long label, and a registration that has
-    /// already reached [`MAX_ATTESTATIONS_PER_CONTRACT`].
     pub fn attest(
         env: Env,
         attester: Address,
@@ -1662,12 +2213,14 @@ impl LuminaRegistry {
     ) -> Result<(), RegistryError> {
         attester.require_auth();
 
-        if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Contract(contract_id.clone()))
+        {
             return Err(RegistryError::ContractNotFound);
         }
 
-        // Bounded in length, and non-empty: an empty label carries no claim
-        // but still costs a list entry and an address.
         if label.is_empty() || label.len() > MAX_ATTESTATION_LABEL_LEN {
             return Err(RegistryError::InvalidAttestation);
         }
@@ -1675,18 +2228,20 @@ impl LuminaRegistry {
         let mut attestations = Self::attestations_of(&env, &contract_id);
         let created_at = env.ledger().sequence();
 
-        // Replace this attester's existing record rather than appending, so
-        // the list stays one-per-attester and the label is always current.
         for i in 0..attestations.len() {
             if let Some(existing) = attestations.get(i) {
                 if existing.attester == attester {
                     let recorded = label.clone();
-                    attestations.set(i, Attestation {
-                        attester: attester.clone(),
-                        label,
-                        created_at,
-                    });
-                    env.storage().persistent()
+                    attestations.set(
+                        i,
+                        Attestation {
+                            attester: attester.clone(),
+                            label,
+                            created_at,
+                        },
+                    );
+                    env.storage()
+                        .persistent()
                         .set(&DataKey::Attestations(contract_id.clone()), &attestations);
                     env.events().publish(
                         (Symbol::new(&env, "attestation_updated"),),
@@ -1706,7 +2261,8 @@ impl LuminaRegistry {
             label,
             created_at,
         });
-        env.storage().persistent()
+        env.storage()
+            .persistent()
             .set(&DataKey::Attestations(contract_id.clone()), &attestations);
 
         env.events().publish(
@@ -1718,15 +2274,6 @@ impl LuminaRegistry {
     }
 
     /// Withdraw your own attestation from a registration.
-    ///
-    /// Scoped to the caller's own record: it removes the single attestation
-    /// whose `attester` equals `attester`, and errors if the caller has none.
-    /// No caller can remove anyone else's attestation — not a registry admin,
-    /// not the registration's owner, not a third party. That is the point:
-    /// a claim stays exactly as long as the party making it stands behind it,
-    /// and nobody else gets to decide that for them.
-    ///
-    /// Returns the number of attestations remaining.
     pub fn revoke_attestation(
         env: Env,
         attester: Address,
@@ -1734,22 +2281,29 @@ impl LuminaRegistry {
     ) -> Result<u32, RegistryError> {
         attester.require_auth();
 
-        if !env.storage().persistent().has(&DataKey::Contract(contract_id.clone())) {
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Contract(contract_id.clone()))
+        {
             return Err(RegistryError::ContractNotFound);
         }
 
         let mut attestations = Self::attestations_of(&env, &contract_id);
 
-        // Match on the recorded attester, not on any caller-supplied address,
-        // so there is no argument through which one party can target another's
-        // attestation.
         let index = (0..attestations.len())
-            .find(|i| attestations.get(*i).map(|a| a.attester == attester).unwrap_or(false))
+            .find(|i| {
+                attestations
+                    .get(*i)
+                    .map(|a| a.attester == attester)
+                    .unwrap_or(false)
+            })
             .ok_or(RegistryError::AttestationNotFound)?;
 
         attestations.remove(index);
         let remaining = attestations.len();
-        env.storage().persistent()
+        env.storage()
+            .persistent()
             .set(&DataKey::Attestations(contract_id), &attestations);
 
         env.events().publish(
@@ -1761,7 +2315,6 @@ impl LuminaRegistry {
     }
 
     /// Every third-party attestation on a registration, oldest first.
-    /// Returns an empty list for a registration that has none.
     pub fn get_attestations(env: Env, contract_id: Address) -> Vec<Attestation> {
         Self::attestations_of(&env, &contract_id)
     }
@@ -1769,25 +2322,19 @@ impl LuminaRegistry {
     // ── Staking ─────────────────────────────────────────────────────────────
 
     /// Post collateral against a registration you own.
-    ///
-    /// Staking is a separate call rather than a `register_contract` parameter
-    /// on purpose: registration stays free and permissionless (anyone can list
-    /// a contract for indexing), and stake is the *optional* signal layered on
-    /// top. It also means the registrations that already exist can acquire a
-    /// stake without re-registering.
-    ///
-    /// Additive — calling it again tops the stake up.
     pub fn stake(
         env: Env,
-        owner: Address,
+        staker: Address,
         contract_id: Address,
         amount: i128,
     ) -> Result<(), RegistryError> {
-        owner.require_auth();
+        staker.require_auth();
 
         Self::validate_positive_amount(amount)?;
 
-        let entry: ContractEntry = env.storage().persistent()
+        let entry: ContractEntry = env
+            .storage()
+            .persistent()
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
@@ -1797,64 +2344,78 @@ impl LuminaRegistry {
 
         let (token_id, _) = Self::staking_config(&env)?;
 
-        // Moves real tokens into the registry's own balance. `owner` has
-        // already authorized this invocation, and the token's own
-        // `from.require_auth()` runs as a sub-invocation of it.
         token::Client::new(&env, &token_id).transfer(
-            &owner,
+            &staker,
             &env.current_contract_address(),
             &amount,
         );
 
         let old_stake = Self::stake_of(&env, &contract_id);
         let staked = old_stake + amount;
-        env.storage().persistent().set(&DataKey::Stake(contract_id.clone()), &staked);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Stake(contract_id.clone()), &staked);
 
-        let total_staked: i128 = env.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
-        env.storage().instance().set(&DataKey::TotalStaked, &(total_staked + amount));
+        // Increment active staked count counter if transitioning from zero stake
+        if old_stake == 0 && staked > 0 {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::StakedCount)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::StakedCount, &(count + 1));
+        }
 
-        let minimum: i128 = env.storage().instance().get(&DataKey::MinimumStake).unwrap_or(0);
+        let total_staked: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalStaked)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalStaked, &(total_staked + amount));
+
+        let minimum: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinimumStake)
+            .unwrap_or(0);
         if minimum > 0 && old_stake < minimum && staked >= minimum {
             env.events().publish(
                 (Symbol::new(&env, "stake_crossed_minimum"),),
-                (contract_id.clone(), staked, minimum, Symbol::new(&env, "above")),
+                (
+                    contract_id.clone(),
+                    staked,
+                    minimum,
+                    Symbol::new(&env, "above"),
+                ),
             );
         }
 
         env.events().publish(
             (Symbol::new(&env, "stake_deposited"),),
-            (contract_id, owner, amount, staked),
+            (contract_id, staker, amount, staked),
         );
 
         Ok(())
     }
 
     /// Reclaim the full remaining stake for a registration.
-    ///
-    /// "Good standing" is three conditions, all checked here:
-    ///
-    /// 1. the caller is the registered owner;
-    /// 2. the registration is **deactivated** — you get your collateral back
-    ///    by leaving, not while still listed and benefiting from the stake;
-    /// 3. no slash has landed within the last [`SLASH_LOCK_LEDGERS`] ledgers,
-    ///    so an owner cannot front-run governance by emptying the stake as
-    ///    soon as the first slash reveals it is being watched.
-    ///
-    /// Returns the amount returned to the owner.
     pub fn withdraw_stake(
         env: Env,
-        owner: Address,
+        staker: Address,
         contract_id: Address,
     ) -> Result<i128, RegistryError> {
-        owner.require_auth();
+        staker.require_auth();
 
-        let entry: ContractEntry = env.storage().persistent()
+        let entry: ContractEntry = env
+            .storage()
+            .persistent()
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
-        if owner != entry.owner {
-            return Err(RegistryError::NotOwner);
-        }
         if entry.active {
             return Err(RegistryError::RegistrationActive);
         }
@@ -1862,55 +2423,88 @@ impl LuminaRegistry {
             return Err(RegistryError::StakeLocked);
         }
 
-        let staked = Self::stake_of(&env, &contract_id);
+        let staked = Self::stake_of_staker(&env, &contract_id, &staker);
         if staked <= 0 {
             return Err(RegistryError::InsufficientStake);
         }
 
         let (token_id, _) = Self::staking_config(&env)?;
 
-        // The registry is the `from` here, and a contract authorizes moving
-        // its own balance by virtue of being the invoker.
         token::Client::new(&env, &token_id).transfer(
             &env.current_contract_address(),
-            &owner,
+            &staker,
             &staked,
         );
 
-        env.storage().persistent().set(&DataKey::Stake(contract_id.clone()), &0i128);
+        env.storage().persistent()
+            .set(&DataKey::StakeOf(contract_id.clone(), staker.clone()), &0i128);
+        let remaining = Self::stake_of(&env, &contract_id) - staked;
+        env.storage().persistent().set(&DataKey::Stake(contract_id.clone()), &remaining);
+        if remaining == 0 {
+            env.storage().persistent().remove(&DataKey::Stakers(contract_id.clone()));
+        }
 
-        let total_staked: i128 = env.storage().instance().get(&DataKey::TotalStaked).unwrap_or(0);
-        env.storage().instance().set(&DataKey::TotalStaked, &(total_staked - staked));
+        // Decrement staked contract count
+        let staked_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::StakedCount)
+            .unwrap_or(0);
+        if staked_count > 0 {
+            env.storage()
+                .instance()
+                .set(&DataKey::StakedCount, &(staked_count - 1));
+        }
 
-        let minimum: i128 = env.storage().instance().get(&DataKey::MinimumStake).unwrap_or(0);
-        if minimum > 0 && staked >= minimum && 0 < minimum {
+        let total_staked: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalStaked)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalStaked, &(total_staked - staked));
+
+        let minimum: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinimumStake)
+            .unwrap_or(0);
+        if minimum > 0 && staked >= minimum {
             env.events().publish(
                 (Symbol::new(&env, "stake_crossed_minimum"),),
-                (contract_id.clone(), 0i128, minimum, Symbol::new(&env, "below")),
+                (
+                    contract_id.clone(),
+                    0i128,
+                    minimum,
+                    Symbol::new(&env, "below"),
+                ),
             );
         }
 
         env.events().publish(
             (Symbol::new(&env, "stake_withdrawn"),),
-            (contract_id, owner, staked),
+            (contract_id, staker, staked),
         );
 
         Ok(staked)
     }
 
-    // ─── View ──────────────────────────────────────────────────────────────
+    // ── Views ──────────────────────────────────────────────────────────────
 
     /// Which build of the registry is live at this address.
     pub fn get_version(_env: Env) -> u32 {
         CONTRACT_VERSION
     }
 
-    /// The first admin address (kept for backward compatibility with v2 tests
-    /// that call `get_admin`).
+    /// The first admin address.
     pub fn get_admin(env: Env) -> Result<Address, RegistryError> {
-        // Prefer the legacy single-admin key so the upgrade tests work as-is.
-        if let Some(a) = env.storage().instance().get::<DataKey, Address>(&DataKey::Admin) {
-            return Ok(a);
+        if let Some(a) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+        {
+            return Ok(legacy);
         }
         let admins = Self::admin_index(&env);
         admins.get(0).ok_or(RegistryError::NotInitialized)
@@ -1938,25 +2532,12 @@ impl LuminaRegistry {
         Self::load_proposal(&env, proposal_id)
     }
 
-    /// The categories a registration declared. Empty for one registered
-    /// before the taxonomy existed — see `set_categories`.
+    /// The categories a registration declared.
     pub fn get_categories(env: Env, contract_id: Address) -> Vec<Category> {
         Self::categories_of(&env, &contract_id)
     }
 
-    /// Paginated list of active registrations in one category, in
-    /// registration order.
-    ///
-    /// Semantics match [`LuminaRegistry::get_active_contracts`] exactly,
-    /// including the one that surprises people: `offset` indexes into the
-    /// category's raw index, not into the filtered result, so a page can come
-    /// back shorter than `limit` when it spans deactivated entries.
-    ///
-    /// `deactivate` deliberately does not touch category indices — filtering
-    /// here on `active` is what keeps a deactivated registration out of
-    /// browsing, exactly as it does for the global listing, and it means
-    /// reactivating a registration would restore it to every category it
-    /// already claimed.
+    /// Paginated list of active registrations in one category.
     pub fn get_active_contracts_by_category(
         env: Env,
         category: Category,
@@ -1969,7 +2550,11 @@ impl LuminaRegistry {
         let mut i = offset;
         while i < index.len() && result.len() < limit {
             if let Some(contract_id) = index.get(i) {
-                if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
+                if let Some(entry) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id))
+                {
                     if entry.active {
                         result.push_back(entry);
                     }
@@ -1981,18 +2566,26 @@ impl LuminaRegistry {
         result
     }
 
+    /// Cursor form of [`LuminaRegistry::get_active_contracts_by_category`].
+    ///
+    /// `cursor` is the `contract_id` of the last entry the previous call
+    /// returned (`None` to start at the beginning). The position is anchored to
+    /// a registration rather than to a numeric index, so a registration added
+    /// mid-walk is appended after the cursor and cannot duplicate or skip an
+    /// entry already returned. Named without the `active_` prefix, and without
+    /// `get_active_contracts_by_category`'s full length, because Soroban caps
+    /// exported names at 32 characters.
+    pub fn get_contracts_by_category_after(
+        env: Env,
+        category: Category,
+        cursor: Option<Address>,
+        limit: u32,
+    ) -> Vec<ContractEntry> {
+        let index = Self::category_index(&env, &category);
+        Self::active_page_after(&env, &index, &cursor, limit)
+    }
+
     /// Paginated list of active registrations in multiple categories.
-    ///
-    /// Returns contracts appearing in ANY of the selected categories (union),
-    /// deduplicated so a contract appearing in several categories appears once.
-    /// Results are in registration order (the order they first appear when
-    /// iterating the combined indices).
-    ///
-    /// `categories` may not be empty; an empty selection returns a validation error.
-    ///
-    /// Named `get_contracts_by_categories` because Soroban caps exported
-    /// contract function names at 32 characters and the longer spelling
-    /// (34) is rejected at compile time.
     pub fn get_contracts_by_categories(
         env: Env,
         categories: Vec<Category>,
@@ -2012,7 +2605,11 @@ impl LuminaRegistry {
                 if !seen.contains(&contract_id) {
                     seen.push_back(contract_id.clone());
 
-                    if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone())) {
+                    if let Some(entry) = env
+                        .storage()
+                        .persistent()
+                        .get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone()))
+                    {
                         if entry.active {
                             result.push_back(entry);
                         }
@@ -2034,55 +2631,58 @@ impl LuminaRegistry {
         Ok(page)
     }
 
-    /// `(stake_token, treasury)`, or `StakingNotConfigured` if governance has
-    /// not opened staking yet.
     pub fn get_staking_config(env: Env) -> Result<(Address, Address), RegistryError> {
         Self::staking_config(&env)
     }
 
-    /// The current registration fee. Zero means registration is free.
     pub fn get_registration_fee(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey::RegistrationFee).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&DataKey::RegistrationFee)
+            .unwrap_or(0)
     }
 
-    /// The current minimum stake threshold. Zero means no minimum.
     pub fn get_minimum_stake(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey::MinimumStake).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&DataKey::MinimumStake)
+            .unwrap_or(0)
     }
 
-    /// Currently staked balance. Zero for a registration that never staked.
     pub fn get_stake(env: Env, contract_id: Address) -> i128 {
         Self::stake_of(&env, &contract_id)
     }
 
-    /// Whether governance has attested this registration.
     pub fn is_verified(env: Env, contract_id: Address) -> bool {
-        env.storage().persistent()
+        env.storage()
+            .persistent()
             .get(&DataKey::Verified(contract_id))
             .unwrap_or(false)
     }
 
-    /// Aggregate registry statistics: total, active, verified, staked counts and total staked.
-    /// This is a constant-cost view built on maintained counters.
+    /// Aggregate registry statistics running in O(1) time.
     pub fn get_registry_stats(env: Env) -> RegistryStats {
-        let total_registered = env.storage().instance()
+        let total_registered = env
+            .storage()
+            .instance()
             .get::<DataKey, u32>(&DataKey::TotalRegistered)
             .unwrap_or(0);
         let active_count = Self::get_active_contract_count(env.clone());
-        let verified_count = env.storage().instance()
+        let verified_count = env
+            .storage()
+            .instance()
             .get::<DataKey, u32>(&DataKey::VerifiedCount)
             .unwrap_or(0);
-        let total_staked = env.storage().instance()
+        let total_staked = env
+            .storage()
+            .instance()
             .get::<DataKey, i128>(&DataKey::TotalStaked)
             .unwrap_or(0);
-
-        let mut staked_count: u32 = 0;
-        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
-        for contract_id in all.iter() {
-            if Self::stake_of(&env, &contract_id) > 0 {
-                staked_count += 1;
-            }
-        }
+        let staked_count = env
+            .storage()
+            .instance()
+            .get::<DataKey, u32>(&DataKey::StakedCount)
+            .unwrap_or(0);
 
         RegistryStats {
             total_registered,
@@ -2093,232 +2693,144 @@ impl LuminaRegistry {
         }
     }
 
-    /// Every slash levied against a registration, oldest first.
     pub fn get_slashes(env: Env, contract_id: Address) -> Vec<SlashRecord> {
         Self::slash_history(&env, &contract_id)
     }
 
-    /// The full reputation signal for a registration. Returns zeroed values
-    /// rather than erroring for an unregistered address, mirroring
-    /// `is_registered`'s tolerance.
+    /// Attach an owner response to a slash record.
+    pub fn respond_to_slash(
+        env: Env,
+        owner: Address,
+        contract_id: Address,
+        slash_index: u32,
+        response: String,
+    ) -> Result<(), RegistryError> {
+        owner.require_auth();
+
+        if response.is_empty() {
+            return Err(RegistryError::InvalidInput);
+        }
+
+        let entry: ContractEntry = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Contract(contract_id.clone()))
+            .ok_or(RegistryError::ContractNotFound)?;
+
+        if owner != entry.owner {
+            return Err(RegistryError::NotOwner);
+        }
+
+        let mut history = Self::slash_history(&env, &contract_id);
+
+        if slash_index >= history.len() {
+            return Err(RegistryError::SlashNotFound);
+        }
+
+        let mut record = history.get(slash_index).unwrap();
+
+        if record.response.is_some() {
+            return Err(RegistryError::ResponseAlreadyExists);
+        }
+
+        record.response = Some(response.clone());
+        history.set(slash_index, record);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Slashes(contract_id.clone()), &history);
+
+        env.events().publish(
+            (Symbol::new(&env, "slash_response_added"),),
+            (contract_id, slash_index, owner),
+        );
+
+        Ok(())
+    }
+
     pub fn get_reputation(env: Env, contract_id: Address) -> Reputation {
         Self::reputation_of(&env, &contract_id)
     }
 
-    /// A registration joined with its reputation — one call instead of a
-    /// `get_contract` plus a `get_reputation`.
     pub fn get_contract_profile(
         env: Env,
         contract_id: Address,
     ) -> Result<ContractProfile, RegistryError> {
-        let entry: ContractEntry = env.storage().persistent()
+        let entry: ContractEntry = env
+            .storage()
+            .persistent()
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
         let mut slashed_total: i128 = 0;
-        let slashes: Vec<SlashRecord> = env.storage().persistent()
+        let slashes: Vec<SlashRecord> = env
+            .storage()
+            .persistent()
             .get(&DataKey::Slashes(contract_id.clone()))
             .unwrap_or(Vec::new(&env));
         for record in slashes.iter() {
             slashed_total += record.amount;
         }
 
+        let withdraw_locked_until = env.storage().persistent()
+            .get(&DataKey::WithdrawLockedUntil(contract_id.clone()))
+            .unwrap_or(0);
+
         let reputation = Reputation {
-            stake: env.storage().persistent()
+            stake: env
+                .storage()
+                .persistent()
                 .get(&DataKey::Stake(contract_id.clone()))
                 .unwrap_or(0),
-            verified: env.storage().persistent()
+            verified: env
+                .storage()
+                .persistent()
                 .get(&DataKey::Verified(contract_id.clone()))
                 .unwrap_or(false),
             slashed_total,
-            withdraw_locked_until: env.storage().persistent()
-                .get(&DataKey::WithdrawLockedUntil(contract_id.clone()))
-                .unwrap_or(0),
+            withdraw_locked_until,
+            withdraw_locked: env.ledger().sequence() < withdraw_locked_until,
         };
 
         Ok(ContractProfile {
             reputation,
             entry,
-            superseded_by: env.storage().persistent()
-                .get(&DataKey::SupersededBy(contract_id)),
+            metadata_uri: env.storage().persistent().get(&DataKey::MetadataUri(contract_id.clone())),
+            superseded_by: env
+                .storage()
+                .persistent()
+                .get(&DataKey::SupersededBy(contract_id.clone())),
+            registered_at_ts: env
+                .storage()
+                .persistent()
+                .get(&DataKey::ContractTimestamp(contract_id))
+                .unwrap_or(0),
         })
     }
 
-    /// `get_active_contracts`, with each entry's reputation attached. Same
-    /// offset/limit and active-filtering semantics.
+    /// `get_active_contracts`, with each entry's reputation attached.
     pub fn get_active_profiles(env: Env, offset: u32, limit: u32) -> Vec<ContractProfile> {
-        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
+        let all = Self::all_contracts(&env);
         let mut result = Vec::new(&env);
 
         let mut i = offset;
         while i < all.len() && result.len() < limit {
             if let Some(contract_id) = all.get(i) {
-                if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone())) {
+                if let Some(entry) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone()))
+                {
                     if entry.active {
                         result.push_back(ContractProfile {
                             reputation: Self::reputation_of(&env, &contract_id),
-                            superseded_by: env.storage().persistent()
-                                .get(&DataKey::SupersededBy(contract_id.clone())),
                             entry,
+                            superseded_by: env
+                                .storage()
+                                .persistent()
+                                .get(&DataKey::SupersededBy(contract_id)),
                         });
                     }
-                }
-            }
-            i += 1;
-        }
-
-        result
-    }
-
-    /// Retrieve the metadata entry for a registered contract.
-    pub fn get_contract(env: Env, contract_id: Address) -> Result<ContractEntry, RegistryError> {
-        env.storage().persistent()
-            .get(&DataKey::Contract(contract_id))
-            .ok_or(RegistryError::ContractNotFound)
-    }
-
-    /// Live registrations: deactivated entries included, deregistered ones
-    /// not. Incremented on `register_contract`, decremented on `deregister`.
-    /// This is the figure a "how many entries exist right now" consumer wants.
-    /// For lifetime registrations ever made see `get_total_registered`; for
-    /// currently listed (active) entries see `get_active_contract_count` (the
-    /// frontend stats page should read that one).
-    pub fn get_contract_count(env: Env) -> u32 {
-        env.storage().instance().get(&DataKey::ContractCount).unwrap_or(0)
-    }
-
-    /// Lifetime registrations ever made. Incremented on `register_contract`
-    /// and never decremented, so it keeps counting across `deregister`.
-    /// Falls back to `ContractCount` on deployments that predate the split
-    /// (where the single counter was the lifetime figure).
-    pub fn get_total_registered(env: Env) -> u32 {
-        if let Some(total) = env.storage().instance().get::<DataKey, u32>(&DataKey::TotalRegistered) {
-            return total;
-        }
-        env.storage().instance().get(&DataKey::ContractCount).unwrap_or(0)
-    }
-
-    /// Currently listed (active) registrations. Walks `AllContracts` and
-    /// counts entries that still load and are flagged active, skipping dead
-    /// references exactly as `get_active_contracts` does.
-    pub fn get_active_contract_count(env: Env) -> u32 {
-        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
-        let mut active: u32 = 0;
-        for contract_id in all.iter() {
-            if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
-                if entry.active {
-                    active += 1;
-                }
-            }
-        }
-        active
-    }
-
-    pub fn is_registered(env: Env, contract_id: Address) -> bool {
-        env.storage().persistent().has(&DataKey::Contract(contract_id))
-    }
-
-    /// Paginated list of active registered contracts in registration order.
-    pub fn get_active_contracts(env: Env, offset: u32, limit: u32) -> Vec<ContractEntry> {
-        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
-        let mut result = Vec::new(&env);
-
-        let mut i = offset;
-        while i < all.len() && result.len() < limit {
-            if let Some(contract_id) = all.get(i) {
-                if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
-                    if entry.active {
-                        result.push_back(entry);
-                    }
-                }
-            }
-            i += 1;
-        }
-
-        result
-    }
-
-    /// Paginated list of active contract addresses only, intended for indexers
-    /// that need only the addresses without the full entries.
-    pub fn get_active_contract_ids(env: Env, offset: u32, limit: u32) -> Vec<Address> {
-        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
-        let mut result = Vec::new(&env);
-
-        let mut i = offset;
-        while i < all.len() && result.len() < limit {
-            if let Some(contract_id) = all.get(i) {
-                if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone())) {
-                    if entry.active {
-                        result.push_back(contract_id);
-                    }
-                }
-            }
-            i += 1;
-        }
-
-        result
-    }
-
-    /// Paginated list of active registered contracts with indication of whether more results exist.
-    pub fn get_active_contracts_page(env: Env, offset: u32, limit: u32) -> ContractPage {
-        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
-        let mut entries = Vec::new(&env);
-
-        let mut i = offset;
-        while i < all.len() && entries.len() < limit {
-            if let Some(contract_id) = all.get(i) {
-                if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
-                    if entry.active {
-                        entries.push_back(entry);
-                    }
-                }
-            }
-            i += 1;
-        }
-
-        let has_more = i < all.len();
-
-        ContractPage { entries, has_more }
-    }
-
-    /// Paginated list of contract profiles with indication of whether more results exist.
-    pub fn get_active_profiles_page(env: Env, offset: u32, limit: u32) -> ContractProfilePage {
-        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllContracts).unwrap_or(Vec::new(&env));
-        let mut entries = Vec::new(&env);
-
-        let mut i = offset;
-        while i < all.len() && entries.len() < limit {
-            if let Some(contract_id) = all.get(i) {
-                if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id.clone())) {
-                    if entry.active {
-                        entries.push_back(ContractProfile {
-                            reputation: Self::reputation_of(&env, &contract_id),
-                            superseded_by: env.storage().persistent()
-                                .get(&DataKey::SupersededBy(contract_id.clone())),
-                            entry,
-                        });
-                    }
-                }
-            }
-            i += 1;
-        }
-
-        let has_more = i < all.len();
-
-        ContractProfilePage { entries, has_more }
-    }
-
-    /// Paginated list of every contract registered by `owner`, including
-    /// deactivated entries.
-    pub fn get_contracts_by_owner(env: Env, owner: Address, offset: u32, limit: u32) -> Vec<ContractEntry> {
-        let owned = Self::owner_index(&env, &owner);
-        let mut result = Vec::new(&env);
-
-        let mut i = offset;
-        while i < owned.len() && result.len() < limit {
-            if let Some(contract_id) = owned.get(i) {
-                if let Some(entry) = env.storage().persistent().get::<DataKey, ContractEntry>(&DataKey::Contract(contract_id)) {
-                    result.push_back(entry);
                 }
             }
             i += 1;
